@@ -99,18 +99,46 @@ static request_t *zero_read_op(object_t *o, request_t *r)
 }
 
 
+/* -2 = not yet tried, -1 = unavailable (use rand()), >=0 = open hwrng fd. */
+static int random_hwrngFd = -2;
+
+/* /dev/urandom. Prefer a hardware RNG (/dev/hwrng — e.g. the BCM2711 RNG200) for real
+ * entropy; fall back to the rand() PRNG where no such device exists. The hwrng fd is
+ * opened lazily and cached, because posixsrv starts before the hwrng driver registers
+ * its node — by the time anything reads /dev/urandom the device is up. Portable: on
+ * targets without /dev/hwrng the open fails once and we stay on the rand() path. */
 static request_t *random_read_op(object_t *o, request_t *r)
 {
 	size_t len = r->msg.o.size;
+	char *dst = r->msg.o.data;
+
+	if (random_hwrngFd == -2) {
+		random_hwrngFd = open("/dev/hwrng", O_RDONLY);
+		printf("posixsrv: /dev/urandom entropy source = %s\n",
+			(random_hwrngFd >= 0) ? "/dev/hwrng (hardware RNG)" : "rand() (no /dev/hwrng)");
+	}
 
 	while (len > 0) {
+		if (random_hwrngFd >= 0) {
+			ssize_t got = read(random_hwrngFd, dst, len);
+			if (got > 0) {
+				dst += got;
+				len -= (size_t)got;
+				continue;
+			}
+			/* hwrng stopped delivering: drop it and finish with rand(). */
+			close(random_hwrngFd);
+			random_hwrngFd = -1;
+		}
+
 		int randbuff[16];
 		size_t chunk = (len > sizeof(randbuff)) ? sizeof(randbuff) : len;
 		size_t limit = (chunk + sizeof(*randbuff) - 1) / sizeof(*randbuff);
 		for (size_t i = 0; i < limit; ++i) {
 			randbuff[i] = rand();
 		}
-		memcpy(r->msg.o.data, randbuff, chunk);
+		memcpy(dst, randbuff, chunk);
+		dst += chunk;     /* advance dst (the prior code left tails past 64 B unwritten) */
 		len -= chunk;
 	}
 
