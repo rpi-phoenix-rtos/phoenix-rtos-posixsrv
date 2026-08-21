@@ -126,6 +126,18 @@ static void tmpfile_release_op(object_t *o)
 }
 
 
+static void tmpfile_ensureDir(void)
+{
+	/* Best-effort (re)creation of the backing directory. tmpfile_init() creates
+	 * it once at startup, but on netboot posixsrv starts on the dummyfs RAM root
+	 * BEFORE the nfs takeover swaps "/" to the export, so the /var/tmp made at
+	 * init no longer exists under the live root. Recreate it lazily at open time
+	 * so tmpfile() works regardless of when (or how many times) the root mounts. */
+	mkdir("/var", 0777);
+	mkdir("/var/tmp", 0777);
+}
+
+
 static int tmpfile_open(void)
 {
 	int err;
@@ -154,6 +166,12 @@ static int tmpfile_open(void)
 	}
 
 	tmpfile->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, DEFFILEMODE);
+	if (tmpfile->fd < 0 && errno == ENOENT) {
+		/* Backing dir missing under the live root (e.g. root swapped since
+		 * tmpfile_init) — recreate it and retry once. */
+		tmpfile_ensureDir();
+		tmpfile->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, DEFFILEMODE);
+	}
 	if (tmpfile->fd < 0) {
 		err = -errno;
 		tmpfile_close_op(&tmpfile->o, NULL);
