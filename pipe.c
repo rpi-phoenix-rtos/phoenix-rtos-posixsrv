@@ -44,11 +44,18 @@ static handler_t pipe_create_op, pipe_write_op, pipe_read_op, pipe_open_op, pipe
 static handler_t pipe_setattr_op, pipe_getattr_op, pipe_destroy_op;
 
 
-static int pipe_lock(handle_t lock, int nonblock)
+/*
+ * Always waits for the lock, O_NONBLOCK or not. It guards only short sections
+ * that never block (a waiting request is queued and the lock dropped), so the
+ * wait is brief. A try-lock for O_NONBLOCK callers turned any concurrent
+ * operation on the same pipe - a read, a poll() status query, another writer -
+ * into a spurious EAGAIN: a non-blocking write failed with room in the buffer.
+ * GLib treats EAGAIN on its wake-up pipe as "already signalled", so that was a
+ * lost main-loop wake-up.
+ */
+static void pipe_lock(handle_t lock)
 {
-	if (nonblock) return mutexTry(lock);
 	while (mutexLock(lock) < 0);
-	return 0;
 }
 
 
@@ -300,10 +307,7 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 		return r;
 	}
 
-	if (pipe_lock(p->lock, mode & O_NONBLOCK) < 0) {
-		r->msg.o.err = -EWOULDBLOCK;
-		return r;
-	}
+	pipe_lock(p->lock);
 
 	if (p->rrefs) {
 		/* write to pending readers */
@@ -367,10 +371,7 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 		return r;
 	}
 
-	if (pipe_lock(p->lock, mode & O_NONBLOCK) < 0) {
-		r->msg.o.err = -EWOULDBLOCK;
-		return r;
-	}
+	pipe_lock(p->lock);
 
 	/* read from buffer */
 	was_full = p->full;
@@ -434,8 +435,7 @@ int pipe_open(pipe_t *p, unsigned flags, request_t *r, int *block)
 {
 	PIPE_TRACE("open %d/%x %s", posixsrv_object_id(&p->object), flags, flags & O_WRONLY ? "W" : "R");
 
-	if (pipe_lock(p->lock, flags & O_NONBLOCK) < 0)
-		return -EWOULDBLOCK;
+	pipe_lock(p->lock);
 
 	if (flags & O_RDWR) {
 		mutexUnlock(p->lock);
