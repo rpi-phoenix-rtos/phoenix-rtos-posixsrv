@@ -103,6 +103,9 @@ extern int rq_id(request_t *r);
 extern unsigned posixsrv_port(void);
 
 
+extern void posixsrv_pollNotify(object_t *o);
+
+
 extern int posixsrv_object_link(object_t *o, const char *path);
 
 

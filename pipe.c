@@ -283,7 +283,7 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 	pipe_t *p = (pipe_t *)o;
 	int sz = rq_sz(r), bytes = 0, c, was_empty;
 	void *buf = rq_buf(r);
-	int block = 0;
+	int block = 0, notify = 0;
 	int mode = r->msg.i.io.mode;
 
 	if (sz == 0) {
@@ -321,6 +321,8 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 		}
 		else if (was_empty) {
 			pipe_event(p, evtDataIn);
+			/* empty -> readable: POLLIN */
+			notify = 1;
 		}
 	}
 	else {
@@ -330,6 +332,9 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 
 	r->msg.o.err = bytes;
 	mutexUnlock(p->lock);
+
+	if (notify)
+		posixsrv_pollNotify(o);
 
 	/* Request enqueued */
 	if (block)
@@ -344,7 +349,7 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 	pipe_t *p = (pipe_t *)o;
 	int sz = rq_sz(r), bytes = 0, c, was_full;
 	void *buf = rq_buf(r);
-	int block = 0;
+	int block = 0, notify = 0;
 	unsigned mode = r->msg.i.io.mode;
 
 	if (sz == 0) {
@@ -374,8 +379,11 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 		while (p->queue != NULL && (c = _pipe_write(p, rq_buf(p->queue), rq_sz(p->queue))))
 			_pipe_wakeup(p, p->queue, c);
 
-		if (!p->full)
+		if (!p->full) {
 			pipe_event(p, evtDataOut);
+			/* full -> room: POLLOUT */
+			notify = 1;
+		}
 	}
 
 	if (!bytes && !p->wrefs) {
@@ -399,6 +407,9 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 		r->msg.o.err = bytes;
 	}
 	mutexUnlock(p->lock);
+
+	if (notify)
+		posixsrv_pollNotify(o);
 
 	/* Request enqueued */
 	if (block)
@@ -482,6 +493,8 @@ static request_t *pipe_open_op(object_t *o, request_t *r)
 
 int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 {
+	int hangup = 0;
+
 	PIPE_TRACE("close %d/%x %s", posixsrv_object_id(&p->object), flags, flags & O_WRONLY ? "W" : "R");
 
 	while (mutexLock(p->lock) < 0);
@@ -497,6 +510,8 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 		if (!p->wrefs) {
 			while (p->queue != NULL)
 				_pipe_wakeup(p, p->queue, 0);
+			/* the last writer is gone: POLLHUP (and EOF) for the readers */
+			hangup = 1;
 		}
 	} else if (flags & O_RDONLY) {
 		if (!p->rrefs) {
@@ -509,10 +524,13 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 		if (!p->rrefs) {
 			while (p->queue != NULL)
 				_pipe_wakeup(p, p->queue, -EPIPE);
+			/* the last reader is gone: POLLHUP (and EPIPE) for the writers */
+			hangup = 1;
 		}
 	}
 
 	if (!p->wrefs && !p->rrefs) {
+		/* nobody is left to poll it */
 		if (!p->link) {
 			posixsrv_object_destroy(&p->object);
 			mutexUnlock(p->lock);
@@ -529,6 +547,10 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 	}
 
 	mutexUnlock(p->lock);
+
+	if (hangup)
+		posixsrv_pollNotify(&p->object);
+
 	return EOK;
 }
 
