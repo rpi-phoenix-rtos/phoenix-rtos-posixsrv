@@ -139,6 +139,7 @@ int pipe_create(int type, int *id, unsigned open)
 	p->link = 0;
 	p->r = p->w = 0;
 	p->queue = NULL;
+	p->evmask = 0;
 
 	posixsrv_object_put(&p->object);
 
@@ -266,9 +267,17 @@ static int _pipe_read(pipe_t *p, void *buf, size_t sz)
 }
 
 
-void pipe_event(pipe_t *p, int type)
+/*
+ * Posts an event to the event server (/dev/event), but only a type somebody has
+ * subscribed to: the event server sets evmask through atEventMask. Posting is a
+ * blocking message to that server, so it is sent with the pipe lock released.
+ */
+static void pipe_event(pipe_t *p, int type)
 {
 	event_t event = { 0 };
+
+	if ((p->evmask & (1 << type)) == 0)
+		return;
 
 	event.oid.port = posixsrv_port();
 	event.oid.id = posixsrv_object_id(&p->object);
@@ -320,7 +329,6 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 			}
 		}
 		else if (was_empty) {
-			pipe_event(p, evtDataIn);
 			/* empty -> readable: POLLIN */
 			notify = 1;
 		}
@@ -333,8 +341,10 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 	r->msg.o.err = bytes;
 	mutexUnlock(p->lock);
 
-	if (notify)
+	if (notify) {
+		pipe_event(p, evtDataIn);
 		posixsrv_pollNotify(o);
+	}
 
 	/* Request enqueued */
 	if (block)
@@ -380,7 +390,6 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 			_pipe_wakeup(p, p->queue, c);
 
 		if (!p->full) {
-			pipe_event(p, evtDataOut);
 			/* full -> room: POLLOUT */
 			notify = 1;
 		}
@@ -408,8 +417,10 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 	}
 	mutexUnlock(p->lock);
 
-	if (notify)
+	if (notify) {
+		pipe_event(p, evtDataOut);
 		posixsrv_pollNotify(o);
+	}
 
 	/* Request enqueued */
 	if (block)
