@@ -44,11 +44,18 @@ static handler_t pipe_create_op, pipe_write_op, pipe_read_op, pipe_open_op, pipe
 static handler_t pipe_setattr_op, pipe_getattr_op, pipe_destroy_op;
 
 
-static int pipe_lock(handle_t lock, int nonblock)
+/*
+ * Always waits for the lock, O_NONBLOCK or not. It guards only short sections
+ * that never block (a waiting request is queued and the lock dropped), so the
+ * wait is brief. A try-lock for O_NONBLOCK callers turned any concurrent
+ * operation on the same pipe - a read, a poll() status query, another writer -
+ * into a spurious EAGAIN: a non-blocking write failed with room in the buffer.
+ * GLib treats EAGAIN on its wake-up pipe as "already signalled", so that was a
+ * lost main-loop wake-up.
+ */
+static void pipe_lock(handle_t lock)
 {
-	if (nonblock) return mutexTry(lock);
 	while (mutexLock(lock) < 0);
-	return 0;
 }
 
 
@@ -139,6 +146,7 @@ int pipe_create(int type, int *id, unsigned open)
 	p->link = 0;
 	p->r = p->w = 0;
 	p->queue = NULL;
+	p->evmask = 0;
 
 	posixsrv_object_put(&p->object);
 
@@ -266,9 +274,17 @@ static int _pipe_read(pipe_t *p, void *buf, size_t sz)
 }
 
 
-void pipe_event(pipe_t *p, int type)
+/*
+ * Posts an event to the event server (/dev/event), but only a type somebody has
+ * subscribed to: the event server sets evmask through atEventMask. Posting is a
+ * blocking message to that server, so it is sent with the pipe lock released.
+ */
+static void pipe_event(pipe_t *p, int type)
 {
 	event_t event = { 0 };
+
+	if ((p->evmask & (1 << type)) == 0)
+		return;
 
 	event.oid.port = posixsrv_port();
 	event.oid.id = posixsrv_object_id(&p->object);
@@ -283,7 +299,7 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 	pipe_t *p = (pipe_t *)o;
 	int sz = rq_sz(r), bytes = 0, c, was_empty;
 	void *buf = rq_buf(r);
-	int block = 0;
+	int block = 0, notify = 0;
 	int mode = r->msg.i.io.mode;
 
 	if (sz == 0) {
@@ -291,10 +307,7 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 		return r;
 	}
 
-	if (pipe_lock(p->lock, mode & O_NONBLOCK) < 0) {
-		r->msg.o.err = -EWOULDBLOCK;
-		return r;
-	}
+	pipe_lock(p->lock);
 
 	if (p->rrefs) {
 		/* write to pending readers */
@@ -320,7 +333,8 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 			}
 		}
 		else if (was_empty) {
-			pipe_event(p, evtDataIn);
+			/* empty -> readable: POLLIN */
+			notify = 1;
 		}
 	}
 	else {
@@ -330,6 +344,11 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 
 	r->msg.o.err = bytes;
 	mutexUnlock(p->lock);
+
+	if (notify) {
+		pipe_event(p, evtDataIn);
+		posixsrv_pollNotify(o);
+	}
 
 	/* Request enqueued */
 	if (block)
@@ -344,7 +363,7 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 	pipe_t *p = (pipe_t *)o;
 	int sz = rq_sz(r), bytes = 0, c, was_full;
 	void *buf = rq_buf(r);
-	int block = 0;
+	int block = 0, notify = 0;
 	unsigned mode = r->msg.i.io.mode;
 
 	if (sz == 0) {
@@ -352,10 +371,7 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 		return r;
 	}
 
-	if (pipe_lock(p->lock, mode & O_NONBLOCK) < 0) {
-		r->msg.o.err = -EWOULDBLOCK;
-		return r;
-	}
+	pipe_lock(p->lock);
 
 	/* read from buffer */
 	was_full = p->full;
@@ -374,8 +390,10 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 		while (p->queue != NULL && (c = _pipe_write(p, rq_buf(p->queue), rq_sz(p->queue))))
 			_pipe_wakeup(p, p->queue, c);
 
-		if (!p->full)
-			pipe_event(p, evtDataOut);
+		if (!p->full) {
+			/* full -> room: POLLOUT */
+			notify = 1;
+		}
 	}
 
 	if (!bytes && !p->wrefs) {
@@ -400,6 +418,11 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 	}
 	mutexUnlock(p->lock);
 
+	if (notify) {
+		pipe_event(p, evtDataOut);
+		posixsrv_pollNotify(o);
+	}
+
 	/* Request enqueued */
 	if (block)
 		return NULL;
@@ -412,8 +435,7 @@ int pipe_open(pipe_t *p, unsigned flags, request_t *r, int *block)
 {
 	PIPE_TRACE("open %d/%x %s", posixsrv_object_id(&p->object), flags, flags & O_WRONLY ? "W" : "R");
 
-	if (pipe_lock(p->lock, flags & O_NONBLOCK) < 0)
-		return -EWOULDBLOCK;
+	pipe_lock(p->lock);
 
 	if (flags & O_RDWR) {
 		mutexUnlock(p->lock);
@@ -482,6 +504,8 @@ static request_t *pipe_open_op(object_t *o, request_t *r)
 
 int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 {
+	int hangup = 0;
+
 	PIPE_TRACE("close %d/%x %s", posixsrv_object_id(&p->object), flags, flags & O_WRONLY ? "W" : "R");
 
 	while (mutexLock(p->lock) < 0);
@@ -497,6 +521,8 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 		if (!p->wrefs) {
 			while (p->queue != NULL)
 				_pipe_wakeup(p, p->queue, 0);
+			/* the last writer is gone: POLLHUP (and EOF) for the readers */
+			hangup = 1;
 		}
 	} else if (flags & O_RDONLY) {
 		if (!p->rrefs) {
@@ -509,10 +535,13 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 		if (!p->rrefs) {
 			while (p->queue != NULL)
 				_pipe_wakeup(p, p->queue, -EPIPE);
+			/* the last reader is gone: POLLHUP (and EPIPE) for the writers */
+			hangup = 1;
 		}
 	}
 
 	if (!p->wrefs && !p->rrefs) {
+		/* nobody is left to poll it */
 		if (!p->link) {
 			posixsrv_object_destroy(&p->object);
 			mutexUnlock(p->lock);
@@ -529,6 +558,10 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 	}
 
 	mutexUnlock(p->lock);
+
+	if (hangup)
+		posixsrv_pollNotify(&p->object);
+
 	return EOK;
 }
 

@@ -164,6 +164,24 @@ unsigned posixsrv_port(void)
 }
 
 
+/*
+ * Tells the kernel that the poll() status of o may have changed, so poll() and
+ * select() callers watching it ask again at once instead of after the kernel's
+ * timed re-poll (20 ms). Call it after the state the atPollStatus answer reads
+ * has been updated. With nobody watching it is a no-op; a kernel without the
+ * call answers -EINVAL and its pollers keep the timed re-poll.
+ */
+void posixsrv_pollNotify(object_t *o)
+{
+	oid_t oid;
+
+	oid.port = posixsrv_common.port;
+	oid.id = posixsrv_object_id(o);
+
+	(void)pollNotify(&oid);
+}
+
+
 static int rq_cmp(rbnode_t *n1, rbnode_t *n2)
 {
 	request_t *r1, *r2;

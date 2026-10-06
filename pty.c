@@ -138,6 +138,39 @@ static inline pty_t *pty_slave(object_t *slave)
 }
 
 
+/*
+ * What poll() would report for each end, as the atPollStatus handlers below
+ * answer it: the slave's events, and POLLIN on the master while there is output
+ * to read (the master is always writable). Taken under pty->mutex before and
+ * after an operation, it tells which end became more ready.
+ */
+typedef struct {
+	unsigned slave, master;
+} pty_ready_t;
+
+
+static pty_ready_t _pty_ready(pty_t *pty)
+{
+	pty_ready_t ready;
+
+	ready.slave = _libtty_poll_status(&pty->tty);
+	ready.master = _libtty_txready(&pty->tty) ? POLLIN : 0;
+
+	return ready;
+}
+
+
+/* Wakes the poll() callers of each end that gained an event. Call with no lock held. */
+static void pty_pollNotify(pty_t *pty, pty_ready_t before, pty_ready_t after)
+{
+	if ((after.slave & ~before.slave) != 0)
+		posixsrv_pollNotify(&pty->slave);
+
+	if ((after.master & ~before.master) != 0)
+		posixsrv_pollNotify(&pty->master);
+}
+
+
 static void pty_destroy(pty_t *pty)
 {
 	if (pty->slave_refs || pty->slave.refs || pty->master.refs)
@@ -218,10 +251,15 @@ static request_t *pts_write_op(object_t *o, request_t *r)
 {
 	PTY_TRACE("pts_write(%d)", posixsrv_object_id(o));
 	pty_t *pty = pty_slave(o);
+	pty_ready_t before, after;
 
 	mutexLock(pty->mutex);
+	before = _pty_ready(pty);
 	r = _pts_write(pty, r);
+	after = _pty_ready(pty);
 	mutexUnlock(pty->mutex);
+
+	pty_pollNotify(pty, before, after);
 
 	return r;
 }
@@ -330,13 +368,19 @@ static request_t *pts_devctl_op(object_t *o, request_t *r)
 	long unsigned request;
 	pty_t *pty = pty_slave(o);
 	pid_t pid = ioctl_getSenderPid(&r->msg);
+	pty_ready_t before, after;
 	int err;
 
 	mutexLock(pty->mutex);
+	before = _pty_ready(pty);
 	in = ioctl_unpackEx(&r->msg, &request, NULL, &out);
 	err = _libtty_ioctl(&pty->tty, pid, request, in, out);
 	ioctl_setResponse(&r->msg, request, err, NULL);
+	/* termios (ICANON off with input queued) or a flush can change readiness */
+	after = _pty_ready(pty);
 	mutexUnlock(pty->mutex);
+
+	pty_pollNotify(pty, before, after);
 
 	return r;
 }
@@ -350,8 +394,10 @@ static request_t *ptm_write_op(object_t *o, request_t *r)
 	int wake_reader = 0, wake_reader_helper = 0;
 	request_t *reader;
 	event_t event = {0};
+	pty_ready_t before, after;
 
 	mutexLock(pty->mutex);
+	before = _pty_ready(pty);
 
 	/* On master write wake pending slave readers up */
 	for (i = 0; i < r->msg.i.size; ++i) {
@@ -372,7 +418,11 @@ static request_t *ptm_write_op(object_t *o, request_t *r)
 		wake_reader = _libtty_poll_status(&pty->tty) & POLLIN;
 	}
 
+	/* input for the slave, and its echo for the master */
+	after = _pty_ready(pty);
 	mutexUnlock(pty->mutex);
+
+	pty_pollNotify(pty, before, after);
 
 	if (wake_reader && (pty->evmask & (1 << evtDataIn))) {
 		event.oid.port = posixsrv_port();
@@ -445,10 +495,16 @@ static request_t *ptm_read_op(object_t *o, request_t *r)
 {
 	PTY_TRACE("ptm_read(%d)", posixsrv_object_id(o));
 	pty_t *pty = pty_master(o);
+	pty_ready_t before, after;
 
 	mutexLock(pty->mutex);
+	before = _pty_ready(pty);
 	r = _ptm_read(pty, r);
+	/* room for the slave's output */
+	after = _pty_ready(pty);
 	mutexUnlock(pty->mutex);
+
+	pty_pollNotify(pty, before, after);
 
 	return r;
 }
@@ -457,9 +513,11 @@ static request_t *ptm_read_op(object_t *o, request_t *r)
 static request_t *ptm_close_op(object_t *o, request_t *r)
 {
 	pty_t *pty = pty_master(o);
+	pty_ready_t before, after;
 	int err = EOK;
 
 	mutexLock(pty->mutex);
+	before = _pty_ready(pty);
 	if (!(pty->state & MASTER_OPEN)) {
 		log_error("master not open");
 		err = -EINVAL;
@@ -475,7 +533,11 @@ static request_t *ptm_close_op(object_t *o, request_t *r)
 		_libtty_close(&pty->tty);
 		posixsrv_object_destroy(&pty->master);
 	}
+	/* POLLHUP for the slave */
+	after = _pty_ready(pty);
 	mutexUnlock(pty->mutex);
+
+	pty_pollNotify(pty, before, after);
 
 	rq_setResponse(r, err);
 	return r;
@@ -572,10 +634,12 @@ static request_t *ptm_devctl_op(object_t *o, request_t *r)
 	pid_t ctty;
 	const void *in_data;
 	void *out_data;
+	pty_ready_t before, after;
 
 	in_data = ioctl_unpackEx(&r->msg, &request, NULL, &out_data);
 
 	mutexLock(pty->mutex);
+	before = _pty_ready(pty);
 	PTY_TRACE("ptm_devctl request: %lx", request);
 
 	/*
@@ -659,7 +723,10 @@ static request_t *ptm_devctl_op(object_t *o, request_t *r)
 			out_data = NULL;
 			break;
 	}
+	after = _pty_ready(pty);
 	mutexUnlock(pty->mutex);
+
+	pty_pollNotify(pty, before, after);
 
 	ioctl_setResponse(&r->msg, request, err, out_data);
 
