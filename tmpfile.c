@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/threads.h>
+#include <pthread.h>
 #include <posix/idtree.h>
 
 #include "posixsrv_private.h"
@@ -58,7 +59,7 @@ static operations_t tmpfile_ops = {
 
 typedef struct _tmpfile_t {
 	object_t o;
-	handle_t lock;
+	pthread_mutex_t lock;
 
 	int fd;
 	int id;
@@ -72,10 +73,10 @@ static request_t *tmpfile_fw_op(object_t *o, request_t *r)
 	int err;
 	tmpfile_t *tmpfile = (tmpfile_t *)o;
 
-	mutexLock(tmpfile->lock);
+	(void)pthread_mutex_lock(&tmpfile->lock);
 	r->msg.oid = tmpfile->oid;
 	err	= msgSend(tmpfile->oid.port, &r->msg);
-	mutexUnlock(tmpfile->lock);
+	(void)pthread_mutex_unlock(&tmpfile->lock);
 
 	if (err != 0) {
 		rq_setResponse(r, err);
@@ -120,9 +121,7 @@ static void tmpfile_release_op(object_t *o)
 			unlink(path);
 		}
 	}
-	if (tmpfile->lock != -1) {
-		resourceDestroy(tmpfile->lock);
-	}
+	(void)pthread_mutex_destroy(&tmpfile->lock);
 	free(tmpfile);
 }
 
@@ -150,10 +149,9 @@ static int tmpfile_open(void)
 		return -ENOMEM;
 	}
 	tmpfile->fd = -1;
-	tmpfile->lock = -1;
 	tmpfile->id = -1;
 
-	if (mutexCreate(&tmpfile->lock) < 0) {
+	if (pthread_mutex_init(&tmpfile->lock, NULL) != 0) {
 		free(tmpfile);
 		return -ENOMEM;
 	}
