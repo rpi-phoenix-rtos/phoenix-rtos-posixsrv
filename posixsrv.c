@@ -183,16 +183,22 @@ void posixsrv_pollNotify(object_t *o)
 }
 
 
+/*
+ * Orders the timeout tree by wakeup time, earliest first: the timeout thread
+ * sleeps until lib_rbMinimum(). Requests due at the same time are ordered by
+ * address, as lib_rbInsert() does not insert a node that compares equal to one
+ * already in the tree.
+ */
 static int rq_cmp(rbnode_t *n1, rbnode_t *n2)
 {
 	request_t *r1, *r2;
 	r1 = lib_treeof(request_t, linkage, n1);
 	r2 = lib_treeof(request_t, linkage, n2);
 
-	if (r2->wakeup > r1->wakeup)
-		return 1;
-	else if (r2->wakeup < r1->wakeup)
-		return -1;
+	if (r1->wakeup != r2->wakeup)
+		return (r1->wakeup > r2->wakeup) ? 1 : -1;
+	if (r1 != r2)
+		return ((uintptr_t)r1 > (uintptr_t)r2) ? 1 : -1;
 	return 0;
 }
 
