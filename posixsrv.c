@@ -230,16 +230,19 @@ static int rq_cmp(rbnode_t *n1, rbnode_t *n2)
  */
 void rq_timeout(request_t *r, int ms)
 {
-	gettime(&r->wakeup, NULL);
-	r->wakeup += 1000 * (time_t)ms;
+	time_t wakeup;
+
+	gettime(&wakeup, NULL);
+	wakeup += 1000 * (time_t)ms;
 
 	(void)pthread_mutex_lock(&posixsrv_common.lock);
 	if (r->timer == RQ_ARMED) {
-		/* already in the tree: inserting it again would corrupt it */
+		/* already in the tree: changing its key or inserting it again would corrupt it */
 		(void)pthread_mutex_unlock(&posixsrv_common.lock);
 		log_error("request %d armed twice", r->rid);
 		return;
 	}
+	r->wakeup = wakeup;
 	r->timer = RQ_ARMED;
 	r->object->refs++;
 	lib_rbInsert(&posixsrv_common.timeout, &r->linkage);
