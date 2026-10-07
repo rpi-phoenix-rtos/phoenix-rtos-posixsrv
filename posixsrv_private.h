@@ -29,6 +29,10 @@
 #define log_warn(fmt, ...)  log_sev(LOG_WARNING, fmt, ##__VA_ARGS__)
 #define log_error(fmt, ...) log_sev(LOG_ERR, fmt, ##__VA_ARGS__)
 
+/* request_t.timer */
+enum { RQ_UNTIMED = 0, RQ_ARMED, RQ_EXPIRED };
+
+
 typedef struct request_t {
 	struct request_t *next, *prev;
 	rbnode_t linkage;
@@ -36,6 +40,7 @@ typedef struct request_t {
 
 	struct _object_t *object;
 	time_t wakeup;
+	int timer; /* RQ_UNTIMED etc., guarded by the object table lock (see posixsrv.c) */
 	msg_rid_t rid;
 	msg_t msg;
 
@@ -95,6 +100,12 @@ extern void rq_setResponse(request_t *r, int retval);
 
 
 extern void rq_timeout(request_t *r, int timeout);
+
+
+extern int rq_timeoutCancel(request_t *r);
+
+
+extern void rq_timeoutClaim(request_t *r);
 
 
 extern int rq_id(request_t *r);

@@ -107,17 +107,22 @@ typedef struct {
 
 static void pty_cancelRequests(pty_t *pty)
 {
-	request_t *r;
+	request_t *r, *expired = NULL;
 
 	while ((r = pty->write_requests) != NULL) {
 		LIST_REMOVE(&pty->write_requests, r);
 		rq_wakeup(r);
 	}
 
+	/* slave reads are the only pty requests with a timeout (VTIME) */
 	while ((r = pty->read_requests) != NULL) {
 		LIST_REMOVE(&pty->read_requests, r);
-		rq_wakeup(r);
+		if (rq_timeoutCancel(r))
+			rq_wakeup(r);
+		else
+			LIST_ADD(&expired, r); /* pts_timeout() answers it */
 	}
+	pty->read_requests = expired;
 
 	while ((r = pty->read_master) != NULL) {
 		LIST_REMOVE(&pty->read_master, r);
@@ -228,6 +233,7 @@ static void ptm_destroy(object_t *o)
 
 
 static request_t *_ptm_read(pty_t *pty, request_t *r);
+static request_t *_pts_read(pty_t *pty, request_t *r);
 
 
 static request_t *_pts_write(pty_t *pty, request_t *r)
@@ -270,10 +276,36 @@ static void pts_timeout(request_t *r)
 	pty_t *pty = pty_slave(r->object);
 
 	mutexLock(pty->mutex);
+	rq_timeoutClaim(r);
 	LIST_REMOVE(&pty->read_requests, r);
+
+	/* Resume the read with its timer run out: libtty answers the bytes it has (VMIN > 0) */
+	r->pts_read.timeout_ms = 0;
+	r = _pts_read(pty, r);
 	mutexUnlock(pty->mutex);
 
-	rq_wakeup(r);
+	if (r != NULL)
+		rq_wakeup(r);
+}
+
+
+/* Takes the first pending slave read that is not being timed out right now off its list */
+static request_t *_pts_claimReader(pty_t *pty)
+{
+	request_t *r = pty->read_requests;
+
+	if (r == NULL)
+		return NULL;
+
+	do {
+		if (rq_timeoutCancel(r)) {
+			LIST_REMOVE(&pty->read_requests, r);
+			return r;
+		}
+		r = r->next;
+	} while (r != pty->read_requests);
+
+	return NULL;
 }
 
 
@@ -284,7 +316,8 @@ static request_t *_pts_read(pty_t *pty, request_t *r)
 	err = _libtty_read_nonblock(&pty->tty, r->msg.o.data, r->msg.o.size, r->msg.i.io.mode, &r->pts_read);
 	rq_setResponse(r, err);
 
-	if (r->pts_read.timeout_ms >= 0) {
+	/* libtty: a read answering 0 with timeout_ms >= 0 has to wait (an error ends it) */
+	if (err == 0 && r->pts_read.timeout_ms >= 0) {
 		LIST_ADD(&pty->read_requests, r);
 
 		if (r->pts_read.timeout_ms)
@@ -409,9 +442,7 @@ static request_t *ptm_write_op(object_t *o, request_t *r)
 		_libtty_wake_reader(&pty->tty);
 	}
 
-	if (wake_reader && ((reader = pty->read_requests) != NULL)) {
-		LIST_REMOVE(&pty->read_requests, reader);
-
+	if (wake_reader && ((reader = _pts_claimReader(pty)) != NULL)) {
 		if ((reader = _pts_read(pty, reader)) != NULL)
 			rq_wakeup(reader);
 

@@ -183,29 +183,118 @@ void posixsrv_pollNotify(object_t *o)
 }
 
 
+/*
+ * Orders the timeout tree by wakeup time, earliest first: the timeout thread
+ * sleeps until lib_rbMinimum(). Requests due at the same time are ordered by
+ * address, as lib_rbInsert() does not insert a node that compares equal to one
+ * already in the tree.
+ */
 static int rq_cmp(rbnode_t *n1, rbnode_t *n2)
 {
 	request_t *r1, *r2;
 	r1 = lib_treeof(request_t, linkage, n1);
 	r2 = lib_treeof(request_t, linkage, n2);
 
-	if (r2->wakeup > r1->wakeup)
-		return 1;
-	else if (r2->wakeup < r1->wakeup)
-		return -1;
+	if (r1->wakeup != r2->wakeup)
+		return (r1->wakeup > r2->wakeup) ? 1 : -1;
+	if (r1 != r2)
+		return ((uintptr_t)r1 > (uintptr_t)r2) ? 1 : -1;
 	return 0;
 }
 
 
+/*
+ * Timed requests
+ *
+ * A handler that keeps a request pending (returns NULL) puts it on a list of
+ * its object, guarded by the object's own lock, and may give it a timeout
+ * with rq_timeout(). A timed request is then also in the timeout tree here,
+ * guarded by the table lock (posixsrv_common.lock), as is request_t.timer.
+ *
+ * Lock order: an object's lock, then the table lock. The table lock is the
+ * innermost lock: nothing is taken while holding it, which is why the timeout
+ * thread drops it before calling an object's timeout operation.
+ *
+ * Exactly one party answers and frees a timed request:
+ *  - Completing it for any other reason (data arrived, close), a handler first
+ *    calls rq_timeoutCancel() under the object's lock. Nonzero: the handler
+ *    owns the request and may take it off the object's list, answer and free
+ *    it. Zero: the timeout has already expired and the request belongs to the
+ *    timeout thread -- leave it on the object's list, untouched.
+ *  - The timeout thread takes an expired request out of the tree and marks it
+ *    RQ_EXPIRED under the table lock, then calls the object's timeout operation,
+ *    which takes the object's lock, calls rq_timeoutClaim() and takes the
+ *    request off the object's list to answer it (or to wait again).
+ * An armed request holds a reference to its object, so the object outlives
+ * the timeout operation even if its last client closed it meanwhile.
+ */
 void rq_timeout(request_t *r, int ms)
 {
-	gettime(&r->wakeup, NULL);
-	r->wakeup += 1000 * ms;
+	time_t wakeup;
+
+	gettime(&wakeup, NULL);
+	wakeup += 1000 * (time_t)ms;
 
 	(void)pthread_mutex_lock(&posixsrv_common.lock);
+	if (r->timer == RQ_ARMED) {
+		/* already in the tree: changing its key or inserting it again would corrupt it */
+		(void)pthread_mutex_unlock(&posixsrv_common.lock);
+		log_error("request %d armed twice", r->rid);
+		return;
+	}
+	r->wakeup = wakeup;
+	r->timer = RQ_ARMED;
+	r->object->refs++;
 	lib_rbInsert(&posixsrv_common.timeout, &r->linkage);
 	(void)pthread_mutex_unlock(&posixsrv_common.lock);
 	(void)pthread_cond_signal(&posixsrv_common.cond);
+}
+
+
+/*
+ * Call under the lock of r's object before completing r for any reason other
+ * than its timeout. Returns nonzero if the caller owns r (its timeout, if it
+ * had one, will not fire), zero if r's timeout already expired: the timeout
+ * thread completes r then, and r must stay on the object's list.
+ */
+int rq_timeoutCancel(request_t *r)
+{
+	int owned = 1, armed = 0;
+
+	(void)pthread_mutex_lock(&posixsrv_common.lock);
+	if (r->timer == RQ_ARMED) {
+		lib_rbRemove(&posixsrv_common.timeout, &r->linkage);
+		r->timer = RQ_UNTIMED;
+		armed = 1;
+	}
+	else if (r->timer == RQ_EXPIRED) {
+		owned = 0;
+	}
+	(void)pthread_mutex_unlock(&posixsrv_common.lock);
+
+	/*
+	 * The armed request's reference. Never the last one: every caller holds a
+	 * reference of its own to r's object -- as its handler, as the pty master
+	 * (which keeps one to its slave), or on queue_wakeup()'s list -- so the
+	 * release, which destroys the lock the caller holds, cannot run here.
+	 */
+	if (armed)
+		posixsrv_object_put(r->object);
+
+	return owned;
+}
+
+
+/*
+ * Call from a timeout operation, under the lock of r's object, before taking r
+ * off the object's list: r is an ordinary pending request again, which the
+ * operation may answer, or keep waiting (and rq_timeout() again).
+ */
+void rq_timeoutClaim(request_t *r)
+{
+	(void)pthread_mutex_lock(&posixsrv_common.lock);
+	r->timer = RQ_UNTIMED;
+	(void)pthread_mutex_unlock(&posixsrv_common.lock);
 }
 
 
@@ -236,6 +325,17 @@ void rq_wakeup(request_t *r)
 {
 	TRACE("respond %x", r->rid);
 	msgRespond(r->port, &r->msg, r->rid);
+
+	/*
+	 * Only its owner completes a request, and only the timeout thread changes
+	 * an armed one, so this unlocked read is exact unless the owner forgot
+	 * rq_timeoutCancel(). Leak the request then: freeing it would leave a
+	 * dangling node in the timeout tree.
+	 */
+	if (r->timer == RQ_ARMED) {
+		log_error("request %d completed while its timeout is armed", r->rid);
+		return;
+	}
 	free(r);
 }
 
@@ -294,6 +394,7 @@ void posixsrv_threadMain(void *arg)
 				endthread();
 			}
 			r->port = port;
+			r->timer = RQ_UNTIMED;
 		}
 
 		if (msgRecv(port, &r->msg, &r->rid) < 0) {
@@ -329,6 +430,7 @@ void posixsrv_threadMain(void *arg)
 void posixsrv_threadRqTimeout(void *arg)
 {
 	request_t *r;
+	object_t *o;
 	time_t now;
 	struct timespec deadline;
 
@@ -336,29 +438,36 @@ void posixsrv_threadRqTimeout(void *arg)
 
 	for (;;) {
 		r = lib_treeof(request_t, linkage, lib_rbMinimum(posixsrv_common.timeout.root));
-		if (r != NULL) {
-			gettime(&now, NULL);
+		if (r == NULL) {
+			(void)pthread_cond_wait(&posixsrv_common.cond, &posixsrv_common.lock);
+			continue;
+		}
 
-			if (r->wakeup <= now) {
-				lib_rbRemove(&posixsrv_common.timeout, &r->linkage);
-				if (r->object->operations->timeout != NULL) {
-					r->object->operations->timeout(r);
-				}
-				else {
-					rq_setResponse(r, -ETIME);
-					rq_wakeup(r);
-				}
-				continue;
-			}
-
+		gettime(&now, NULL);
+		if (r->wakeup > now) {
 			/* gettime() is CLOCK_MONOTONIC, the clock of the condition */
 			deadline.tv_sec = r->wakeup / 1000000;
 			deadline.tv_nsec = (long)(r->wakeup % 1000000) * 1000;
 			(void)pthread_cond_timedwait(&posixsrv_common.cond, &posixsrv_common.lock, &deadline);
+			continue;
+		}
+
+		/* r is ours now (see "Timed requests" above); the object's lock comes first */
+		lib_rbRemove(&posixsrv_common.timeout, &r->linkage);
+		r->timer = RQ_EXPIRED;
+		o = r->object;
+		(void)pthread_mutex_unlock(&posixsrv_common.lock);
+
+		if (o->operations->timeout != NULL) {
+			o->operations->timeout(r);
 		}
 		else {
-			(void)pthread_cond_wait(&posixsrv_common.cond, &posixsrv_common.lock);
+			rq_setResponse(r, -ETIME);
+			rq_wakeup(r);
 		}
+		posixsrv_object_put(o); /* the armed request's reference */
+
+		(void)pthread_mutex_lock(&posixsrv_common.lock);
 	}
 }
 

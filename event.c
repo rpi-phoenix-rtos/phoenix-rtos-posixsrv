@@ -628,6 +628,27 @@ static int queue_unpack(msg_t *msg, evsub_t **subs, int *subcnt, event_t **event
 }
 
 
+/* Is any event ready to be read from the queue? */
+static int _queue_pending(evqueue_t *queue)
+{
+	evnote_t *note;
+	int pending = 0;
+
+	if ((note = queue->notes) == NULL)
+		return 0;
+
+	do {
+		(void)pthread_mutex_lock(&note->entry->lock);
+		pending = (note->pend & note->mask & note->enabled) != 0;
+		(void)pthread_mutex_unlock(&note->entry->lock);
+
+		note = note->queue_next;
+	} while (!pending && note != queue->notes);
+
+	return pending;
+}
+
+
 static void queue_wakeup(evqueue_t *queue)
 {
 	TRACE("queue_wakeup()");
@@ -645,16 +666,19 @@ static void queue_wakeup(evqueue_t *queue)
 			r = queue->requests;
 			LIST_REMOVE(&queue->requests, r);
 
-			if (queue_unpack(&r->msg, NULL, NULL, &events, &count, NULL) < 0)
-				continue;
-
-			if ((count = _event_read(queue, events, count))) {
-				LIST_ADD(&filled, r);
-				rq_setResponse(r, count);
-			}
-			else {
+			/* A request whose timeout already expired is queue_timeout_op()'s to answer */
+			if (!_queue_pending(queue) || !rq_timeoutCancel(r)) {
 				LIST_ADD(&empty, r);
+				continue;
 			}
+
+			if (queue_unpack(&r->msg, NULL, NULL, &events, &count, NULL) < 0)
+				count = 0;
+			else
+				count = _event_read(queue, events, count);
+
+			LIST_ADD(&filled, r);
+			rq_setResponse(r, count);
 		}
 		queue->requests = empty;
 		(void)pthread_mutex_unlock(&queue->lock);
@@ -678,15 +702,22 @@ static request_t *queue_close_op(object_t *o, request_t *r)
 	TRACE("queue_close_op()");
 
 	evqueue_t *queue = evqueue(o);
-	request_t *p;
+	request_t *p, *expired = NULL;
 	eventry_t *entry;
 
 	(void)pthread_mutex_lock(&queue->lock);
 	while ((p = queue->requests) != NULL) {
 		LIST_REMOVE(&queue->requests, p);
-		rq_setResponse(p, -EBADF);
-		rq_wakeup(p);
+		if (rq_timeoutCancel(p)) {
+			rq_setResponse(p, -EBADF);
+			rq_wakeup(p);
+		}
+		else {
+			/* its timeout expired: queue_timeout_op() answers it */
+			LIST_ADD(&expired, p);
+		}
 	}
+	queue->requests = expired;
 
 	while (queue->notes != NULL) {
 		entry_ref(entry = queue->notes->entry);
@@ -789,10 +820,22 @@ static void queue_timeout_op(request_t *r)
 	TRACE("queue_timeout_op()");
 
 	evqueue_t *queue = evqueue(r->object);
+	event_t *events;
+	int count = 0;
 
 	(void)pthread_mutex_lock(&queue->lock);
+	rq_timeoutClaim(r);
 	LIST_REMOVE(&queue->requests, r);
+
+	/* events that arrived as the timeout expired, usually none */
+	if (queue_unpack(&r->msg, NULL, NULL, &events, &count, NULL) < 0)
+		count = 0;
+	else
+		count = _event_read(queue, events, count);
 	(void)pthread_mutex_unlock(&queue->lock);
+
+	rq_setResponse(r, count);
+	rq_wakeup(r);
 }
 
 
