@@ -820,11 +820,22 @@ static void queue_timeout_op(request_t *r)
 	TRACE("queue_timeout_op()");
 
 	evqueue_t *queue = evqueue(r->object);
+	event_t *events;
+	int count = 0;
 
 	(void)pthread_mutex_lock(&queue->lock);
 	rq_timeoutClaim(r);
 	LIST_REMOVE(&queue->requests, r);
+
+	/* events that arrived as the timeout expired, usually none */
+	if (queue_unpack(&r->msg, NULL, NULL, &events, &count, NULL) < 0)
+		count = 0;
+	else
+		count = _event_read(queue, events, count);
 	(void)pthread_mutex_unlock(&queue->lock);
+
+	rq_setResponse(r, count);
+	rq_wakeup(r);
 }
 
 

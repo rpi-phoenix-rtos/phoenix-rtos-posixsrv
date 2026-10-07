@@ -233,6 +233,7 @@ static void ptm_destroy(object_t *o)
 
 
 static request_t *_ptm_read(pty_t *pty, request_t *r);
+static request_t *_pts_read(pty_t *pty, request_t *r);
 
 
 static request_t *_pts_write(pty_t *pty, request_t *r)
@@ -277,9 +278,14 @@ static void pts_timeout(request_t *r)
 	mutexLock(pty->mutex);
 	rq_timeoutClaim(r);
 	LIST_REMOVE(&pty->read_requests, r);
+
+	/* Resume the read with its timer run out: libtty answers the bytes it has (VMIN > 0) */
+	r->pts_read.timeout_ms = 0;
+	r = _pts_read(pty, r);
 	mutexUnlock(pty->mutex);
 
-	rq_wakeup(r);
+	if (r != NULL)
+		rq_wakeup(r);
 }
 
 
@@ -310,7 +316,8 @@ static request_t *_pts_read(pty_t *pty, request_t *r)
 	err = _libtty_read_nonblock(&pty->tty, r->msg.o.data, r->msg.o.size, r->msg.i.io.mode, &r->pts_read);
 	rq_setResponse(r, err);
 
-	if (r->pts_read.timeout_ms >= 0) {
+	/* libtty: a read answering 0 with timeout_ms >= 0 has to wait (an error ends it) */
+	if (err == 0 && r->pts_read.timeout_ms >= 0) {
 		LIST_ADD(&pty->read_requests, r);
 
 		if (r->pts_read.timeout_ms)
