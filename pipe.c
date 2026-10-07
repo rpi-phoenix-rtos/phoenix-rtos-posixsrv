@@ -24,6 +24,7 @@
 #include <sys/msg.h>
 #include <sys/file.h>
 #include <sys/threads.h>
+#include <pthread.h>
 #include <sys/list.h>
 #include <sys/mman.h>
 #include <errno.h>
@@ -52,10 +53,19 @@ static handler_t pipe_setattr_op, pipe_getattr_op, pipe_destroy_op;
  * into a spurious EAGAIN: a non-blocking write failed with room in the buffer.
  * GLib treats EAGAIN on its wake-up pipe as "already signalled", so that was a
  * lost main-loop wake-up.
+ *
+ * A user-space lock (pthread, futex based): taking it free and releasing it
+ * with nobody waiting is one atomic operation each, no system call.
  */
-static void pipe_lock(handle_t lock)
+static void pipe_lock(pthread_mutex_t *lock)
 {
-	while (mutexLock(lock) < 0);
+	(void)pthread_mutex_lock(lock);
+}
+
+
+static void pipe_unlock(pthread_mutex_t *lock)
+{
+	(void)pthread_mutex_unlock(lock);
 }
 
 
@@ -64,7 +74,7 @@ static void pipe_destroy(object_t *o);
 
 typedef struct _pipe_t {
 	object_t object;
-	handle_t lock;
+	pthread_mutex_t lock;
 
 	void *buf;
 	unsigned r, w;
@@ -127,12 +137,13 @@ int pipe_create(int type, int *id, unsigned open)
 	if ((p = malloc(sizeof(pipe_t))) == NULL)
 		return -ENOMEM;
 
-	if (mutexCreate(&p->lock) < 0) {
+	if (pthread_mutex_init(&p->lock, NULL) != 0) {
 		free(p);
 		return -ENOMEM;
 	}
 
 	if ((p->buf = mmap(NULL, PIPE_BUFSZ, PROT_READ | PROT_WRITE, MAP_ANONYMOUS, -1, 0)) == MAP_FAILED) {
+		(void)pthread_mutex_destroy(&p->lock);
 		free(p);
 		return -ENOMEM;
 	}
@@ -186,7 +197,7 @@ static void pipe_destroy(object_t *o)
 	if (p->buf != NULL)
 		munmap(p->buf, PIPE_BUFSZ);
 
-	resourceDestroy(p->lock);
+	(void)pthread_mutex_destroy(&p->lock);
 	free(o);
 }
 
@@ -307,7 +318,7 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 		return r;
 	}
 
-	pipe_lock(p->lock);
+	pipe_lock(&p->lock);
 
 	if (p->rrefs) {
 		/* write to pending readers */
@@ -343,7 +354,7 @@ static request_t *pipe_write_op(object_t *o, request_t *r)
 	}
 
 	r->msg.o.err = bytes;
-	mutexUnlock(p->lock);
+	pipe_unlock(&p->lock);
 
 	if (notify) {
 		pipe_event(p, evtDataIn);
@@ -371,7 +382,7 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 		return r;
 	}
 
-	pipe_lock(p->lock);
+	pipe_lock(&p->lock);
 
 	/* read from buffer */
 	was_full = p->full;
@@ -416,7 +427,7 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 	else {
 		r->msg.o.err = bytes;
 	}
-	mutexUnlock(p->lock);
+	pipe_unlock(&p->lock);
 
 	if (notify) {
 		pipe_event(p, evtDataOut);
@@ -435,10 +446,10 @@ int pipe_open(pipe_t *p, unsigned flags, request_t *r, int *block)
 {
 	PIPE_TRACE("open %d/%x %s", posixsrv_object_id(&p->object), flags, flags & O_WRONLY ? "W" : "R");
 
-	pipe_lock(p->lock);
+	pipe_lock(&p->lock);
 
 	if (flags & O_RDWR) {
-		mutexUnlock(p->lock);
+		pipe_unlock(&p->lock);
 		return -EINVAL;
 	}
 	else if (flags & O_WRONLY) {
@@ -449,13 +460,13 @@ int pipe_open(pipe_t *p, unsigned flags, request_t *r, int *block)
 				p->rrefs++;
 			}
 			else if (flags & O_NONBLOCK) {
-				mutexUnlock(p->lock);
+				pipe_unlock(&p->lock);
 				return -ENXIO;
 			}
 			else {
 				PIPE_TRACE("open for writing blocked");
 				LIST_ADD(&p->queue, r);
-				mutexUnlock(p->lock);
+				pipe_unlock(&p->lock);
 				*block = 1;
 				return 0;
 			}
@@ -475,7 +486,7 @@ int pipe_open(pipe_t *p, unsigned flags, request_t *r, int *block)
 			else {
 				PIPE_TRACE("open for reading blocked");
 				LIST_ADD(&p->queue, r);
-				mutexUnlock(p->lock);
+				pipe_unlock(&p->lock);
 				*block = 1;
 				return 0;
 			}
@@ -484,7 +495,7 @@ int pipe_open(pipe_t *p, unsigned flags, request_t *r, int *block)
 		p->rrefs++;
 	}
 
-	mutexUnlock(p->lock);
+	pipe_unlock(&p->lock);
 	return 0;
 }
 
@@ -508,11 +519,11 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 
 	PIPE_TRACE("close %d/%x %s", posixsrv_object_id(&p->object), flags, flags & O_WRONLY ? "W" : "R");
 
-	while (mutexLock(p->lock) < 0);
+	pipe_lock(&p->lock);
 
 	if (flags & O_WRONLY) {
 		if (!p->wrefs) {
-			mutexUnlock(p->lock);
+			pipe_unlock(&p->lock);
 			return -EINVAL;
 		}
 
@@ -526,7 +537,7 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 		}
 	} else if (flags & O_RDONLY) {
 		if (!p->rrefs) {
-			mutexUnlock(p->lock);
+			pipe_unlock(&p->lock);
 			return -EINVAL;
 		}
 
@@ -544,7 +555,7 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 		/* nobody is left to poll it */
 		if (!p->link) {
 			posixsrv_object_destroy(&p->object);
-			mutexUnlock(p->lock);
+			pipe_unlock(&p->lock);
 			return EOK;
 		}
 
@@ -557,7 +568,7 @@ int pipe_close(pipe_t *p, unsigned flags, request_t *r)
 		p->full = 0;
 	}
 
-	mutexUnlock(p->lock);
+	pipe_unlock(&p->lock);
 
 	if (hangup)
 		posixsrv_pollNotify(&p->object);
@@ -578,9 +589,9 @@ int pipe_link(pipe_t *p, const char *path)
 {
 	PIPE_TRACE("link %d", posixsrv_object_id(&p->object));
 
-	while (mutexLock(p->lock) < 0);
+	pipe_lock(&p->lock);
 	p->link++;
-	mutexUnlock(p->lock);
+	pipe_unlock(&p->lock);
 	return EOK;
 }
 
@@ -596,10 +607,10 @@ int pipe_unlink(pipe_t *p, const char *path)
 {
 	PIPE_TRACE("unlink %d", posixsrv_object_id(&p->object));
 
-	while (mutexLock(p->lock) < 0);
+	pipe_lock(&p->lock);
 
 	if (!p->link) {
-		mutexUnlock(p->lock);
+		pipe_unlock(&p->lock);
 		return -EINVAL;
 	}
 
@@ -607,11 +618,11 @@ int pipe_unlink(pipe_t *p, const char *path)
 
 	if (!(p->wrefs && p->rrefs) && !p->link) {
 		posixsrv_object_destroy(&p->object);
-		mutexUnlock(p->lock);
+		pipe_unlock(&p->lock);
 		return EOK;
 	}
 
-	mutexUnlock(p->lock);
+	pipe_unlock(&p->lock);
 	return EOK;
 }
 
@@ -649,7 +660,7 @@ static request_t *pipe_getattr_op(object_t *o, request_t *r)
 	int free;
 
 	if (r->msg.i.attr.type == atPollStatus) {
-		mutexLock(p->lock);
+		pipe_lock(&p->lock);
 		free = _pipe_free(p);
 		if (free)
 			err |= POLLOUT;
@@ -657,7 +668,7 @@ static request_t *pipe_getattr_op(object_t *o, request_t *r)
 			err |= POLLIN;
 		err &= r->msg.i.attr.val;
 		err |= !p->wrefs || !p->rrefs ? POLLHUP : 0;
-		mutexUnlock(p->lock);
+		pipe_unlock(&p->lock);
 	}
 	else {
 		err = -EINVAL;

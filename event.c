@@ -16,6 +16,7 @@
 #include <sys/msg.h>
 #include <sys/file.h>
 #include <sys/threads.h>
+#include <pthread.h>
 #include <sys/rb.h>
 #include <sys/list.h>
 #include <sys/stat.h>
@@ -39,7 +40,7 @@ typedef struct _evqueue_t {
 	struct _evqueue_t *next, *prev;
 
 	object_t object;
-	handle_t lock;
+	pthread_mutex_t lock;
 	request_t *requests;
 	struct _evnote_t *notes;
 } evqueue_t;
@@ -68,7 +69,7 @@ typedef struct _evnote_t {
 typedef struct _eventry_t {
 	rbnode_t node;
 	oid_t oid;
-	handle_t lock;
+	pthread_mutex_t lock;
 	unsigned refs;
 
 	unsigned short mask;
@@ -113,7 +114,7 @@ static operations_t qmx_ops = {
 static struct {
 	object_t sink;
 	object_t qmx;
-	handle_t lock;
+	pthread_mutex_t lock;
 	rbtree_t notes;
 	unsigned port;
 } event_common;
@@ -144,12 +145,12 @@ static void queue_add(evqueue_t *queue, evqueue_t **wakeq)
 {
 	TRACE("queue_add()");
 
-	mutexLock(event_common.lock);
+	(void)pthread_mutex_lock(&event_common.lock);
 	if (queue->next == NULL) {
 		posixsrv_object_ref(&queue->object);
 		LIST_ADD(wakeq, queue);
 	}
-	mutexUnlock(event_common.lock);
+	(void)pthread_mutex_unlock(&event_common.lock);
 }
 
 
@@ -165,9 +166,9 @@ static eventry_t *_entry_find(oid_t *oid)
 
 static void entry_ref(eventry_t *entry)
 {
-	mutexLock(event_common.lock);
+	(void)pthread_mutex_lock(&event_common.lock);
 	++entry->refs;
-	mutexUnlock(event_common.lock);
+	(void)pthread_mutex_unlock(&event_common.lock);
 }
 
 
@@ -175,9 +176,9 @@ static eventry_t *entry_find(oid_t *oid)
 {
 	eventry_t *entry;
 
-	mutexLock(event_common.lock);
+	(void)pthread_mutex_lock(&event_common.lock);
 	entry = _entry_find(oid);
-	mutexUnlock(event_common.lock);
+	(void)pthread_mutex_unlock(&event_common.lock);
 	return entry;
 }
 
@@ -186,7 +187,7 @@ static void _entry_remove(eventry_t *entry)
 {
 	TRACE("_entry_remove()");
 
-	resourceDestroy(entry->lock);
+	(void)pthread_mutex_destroy(&entry->lock);
 	lib_rbRemove(&event_common.notes, &entry->node);
 	free(entry);
 }
@@ -202,7 +203,7 @@ static eventry_t *_entry_new(oid_t *oid)
 		return NULL;
 
 	memcpy(&entry->oid, oid, sizeof(oid_t));
-	mutexCreate(&entry->lock);
+	(void)pthread_mutex_init(&entry->lock, NULL);
 	entry->refs = 1;
 	lib_rbInsert(&event_common.notes, &entry->node);
 	return entry;
@@ -213,20 +214,20 @@ static eventry_t *entry_get(oid_t *oid)
 {
 	eventry_t *entry;
 
-	mutexLock(event_common.lock);
+	(void)pthread_mutex_lock(&event_common.lock);
 	if ((entry = _entry_find(oid)) == NULL)
 		entry = _entry_new(oid);
-	mutexUnlock(event_common.lock);
+	(void)pthread_mutex_unlock(&event_common.lock);
 	return entry;
 }
 
 
 static void entry_put(eventry_t *entry)
 {
-	mutexLock(event_common.lock);
+	(void)pthread_mutex_lock(&event_common.lock);
 	if (!--entry->refs)
 		_entry_remove(entry);
-	mutexUnlock(event_common.lock);
+	(void)pthread_mutex_unlock(&event_common.lock);
 }
 
 
@@ -408,7 +409,7 @@ static int _event_subscribe(evqueue_t *queue, evsub_t *sub, int count)
 			do {
 				entry = note->entry;
 				if (!memcmp(&entry->oid, &sub->oid, sizeof(oid_t))) {
-					mutexLock(entry->lock);
+					(void)pthread_mutex_lock(&entry->lock);
 					goto got_note;
 				}
 				note = note->queue_next;
@@ -421,10 +422,10 @@ static int _event_subscribe(evqueue_t *queue, evsub_t *sub, int count)
 
 		/* we keep one more reference in case the note gets removed */
 		entry_ref(entry);
-		mutexLock(entry->lock);
+		(void)pthread_mutex_lock(&entry->lock);
 
 		if ((note = _note_new(queue, entry)) == NULL) {
-			mutexUnlock(entry->lock);
+			(void)pthread_mutex_unlock(&entry->lock);
 			entry_put(entry);
 			return -ENOMEM;
 		}
@@ -447,7 +448,7 @@ static int _event_subscribe(evqueue_t *queue, evsub_t *sub, int count)
 		if (!note->mask)
 			_note_remove(note);
 
-		mutexUnlock(entry->lock);
+		(void)pthread_mutex_unlock(&entry->lock);
 		entry_put(entry);
 		sub++;
 	}
@@ -474,9 +475,9 @@ void event_register(event_t *events, int count)
 		if ((entry = entry_find(&event->oid)) == NULL)
 			continue;
 
-		mutexLock(entry->lock);
+		(void)pthread_mutex_lock(&entry->lock);
 		_entry_register(entry, event, &wakeq);
-		mutexUnlock(entry->lock);
+		(void)pthread_mutex_unlock(&entry->lock);
 
 		entry_put(entry);
 	}
@@ -494,7 +495,7 @@ static evqueue_t *queue_create(void)
 	if ((queue = calloc(1, sizeof(evqueue_t))) == NULL)
 		return NULL;
 
-	if (mutexCreate(&queue->lock) < 0) {
+	if (pthread_mutex_init(&queue->lock, NULL) != 0) {
 		free(queue);
 		return NULL;
 	}
@@ -514,7 +515,7 @@ static void queue_destroy(object_t *o)
 	if (queue->notes != NULL || queue->requests != NULL)
 		printf("posixsrv/event.c error: destroying busy queue\n");
 
-	resourceDestroy(queue->lock);
+	(void)pthread_mutex_destroy(&queue->lock);
 	free(queue);
 }
 
@@ -531,7 +532,7 @@ static int _event_read(evqueue_t *queue, event_t *event, int eventcnt)
 		return 0;
 
 	do {
-		mutexLock(note->entry->lock);
+		(void)pthread_mutex_lock(&note->entry->lock);
 		for (type = 0; type < sizeof(note->pending) / sizeof(*note->pending) && i < eventcnt; ++type) {
 			typebit = 1 << type;
 
@@ -555,7 +556,7 @@ static int _event_read(evqueue_t *queue, event_t *event, int eventcnt)
 				note->pend &= ~typebit;
 			}
 		}
-		mutexUnlock(note->entry->lock);
+		(void)pthread_mutex_unlock(&note->entry->lock);
 
 		note = note->queue_next;
 	} while (note != queue->notes && i < eventcnt);
@@ -574,9 +575,9 @@ static void _queue_poll(evqueue_t *queue)
 		return;
 
 	do {
-		mutexLock(note->entry->lock); /* TODO: is this lock necessary? */
+		(void)pthread_mutex_lock(&note->entry->lock); /* TODO: is this lock necessary? */
 		_note_poll(note);
-		mutexUnlock(note->entry->lock);
+		(void)pthread_mutex_unlock(&note->entry->lock);
 
 		note = note->queue_next;
 	} while (note != queue->notes);
@@ -639,7 +640,7 @@ static void queue_wakeup(evqueue_t *queue)
 	while ((q = queue) != NULL) {
 		empty = NULL;
 
-		mutexLock(queue->lock);
+		(void)pthread_mutex_lock(&queue->lock);
 		while (queue->requests != NULL) {
 			r = queue->requests;
 			LIST_REMOVE(&queue->requests, r);
@@ -656,11 +657,11 @@ static void queue_wakeup(evqueue_t *queue)
 			}
 		}
 		queue->requests = empty;
-		mutexUnlock(queue->lock);
+		(void)pthread_mutex_unlock(&queue->lock);
 
-		mutexLock(event_common.lock);
+		(void)pthread_mutex_lock(&event_common.lock);
 		LIST_REMOVE(&queue, queue);
-		mutexUnlock(event_common.lock);
+		(void)pthread_mutex_unlock(&event_common.lock);
 
 		posixsrv_object_put(&q->object);
 	}
@@ -680,7 +681,7 @@ static request_t *queue_close_op(object_t *o, request_t *r)
 	request_t *p;
 	eventry_t *entry;
 
-	mutexLock(queue->lock);
+	(void)pthread_mutex_lock(&queue->lock);
 	while ((p = queue->requests) != NULL) {
 		LIST_REMOVE(&queue->requests, p);
 		rq_setResponse(p, -EBADF);
@@ -689,13 +690,13 @@ static request_t *queue_close_op(object_t *o, request_t *r)
 
 	while (queue->notes != NULL) {
 		entry_ref(entry = queue->notes->entry);
-		mutexLock(entry->lock);
+		(void)pthread_mutex_lock(&entry->lock);
 		_note_remove(queue->notes);
 		_entry_recalculate(entry);
-		mutexUnlock(entry->lock);
+		(void)pthread_mutex_unlock(&entry->lock);
 		entry_put(entry);
 	}
-	mutexUnlock(queue->lock);
+	(void)pthread_mutex_unlock(&queue->lock);
 
 	posixsrv_object_destroy(o);
 	return r;
@@ -734,7 +735,7 @@ static request_t *queue_write_op(object_t *o, request_t *r)
 		return r;
 	}
 
-	mutexLock(queue->lock);
+	(void)pthread_mutex_lock(&queue->lock);
 	if (!(count = _queue_readwrite(queue, subs, subcnt, events, evcnt)) && evcnt && timeout) {
 		if (timeout > 0)
 			rq_timeout(r, timeout);
@@ -745,7 +746,7 @@ static request_t *queue_write_op(object_t *o, request_t *r)
 	else {
 		rq_setResponse(r, count);
 	}
-	mutexUnlock(queue->lock);
+	(void)pthread_mutex_unlock(&queue->lock);
 	return r;
 }
 
@@ -767,7 +768,7 @@ static request_t *queue_devctl_op(object_t *o, request_t *r)
 
 	queue_unpack(&r->msg, &subs, &subcnt, &events, &evcnt, &timeout);
 
-	mutexLock(queue->lock);
+	(void)pthread_mutex_lock(&queue->lock);
 	if (!(count = _queue_readwrite(queue, subs, subcnt, events, evcnt))) {
 		LIST_ADD(&queue->requests, r);
 		rq_timeout(r, timeout);
@@ -776,7 +777,7 @@ static request_t *queue_devctl_op(object_t *o, request_t *r)
 	else {
 		rq_setResponse(r, count);
 	}
-	mutexUnlock(queue->lock);
+	(void)pthread_mutex_unlock(&queue->lock);
 
 	return r;
 }
@@ -789,9 +790,9 @@ static void queue_timeout_op(request_t *r)
 
 	evqueue_t *queue = evqueue(r->object);
 
-	mutexLock(queue->lock);
+	(void)pthread_mutex_lock(&queue->lock);
 	LIST_REMOVE(&queue->requests, r);
-	mutexUnlock(queue->lock);
+	(void)pthread_mutex_unlock(&queue->lock);
 }
 
 
@@ -886,7 +887,7 @@ static int event_object_link(object_t *o, char *path)
 
 int event_init(unsigned *port)
 {
-	if (mutexCreate(&event_common.lock) < 0) {
+	if (pthread_mutex_init(&event_common.lock, NULL) != 0) {
 		return -ENOMEM;
 	}
 

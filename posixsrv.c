@@ -23,6 +23,7 @@
 #include <sys/msg.h>
 #include <sys/file.h>
 #include <sys/threads.h>
+#include <pthread.h>
 #include <sys/list.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -44,8 +45,8 @@
 struct {
 	unsigned port;
 
-	handle_t lock;
-	handle_t cond;
+	pthread_mutex_t lock; /* user-space lock: no system call when free */
+	pthread_cond_t cond;  /* CLOCK_MONOTONIC: request wakeups are gettime() times */
 	idtree_t objects;
 	rbtree_t timeout;
 
@@ -72,7 +73,7 @@ object_t *posixsrv_object_get(int id)
 {
 	object_t *o;
 
-	while (mutexLock(posixsrv_common.lock) < 0);
+	(void)pthread_mutex_lock(&posixsrv_common.lock);
 
 	if (posixsrv_common.cache.id == id)
 		o = posixsrv_common.cache.o;
@@ -90,7 +91,7 @@ object_t *posixsrv_object_get(int id)
 		}
 	}
 
-	mutexUnlock(posixsrv_common.lock);
+	(void)pthread_mutex_unlock(&posixsrv_common.lock);
 
 	return o;
 }
@@ -98,15 +99,15 @@ object_t *posixsrv_object_get(int id)
 
 void posixsrv_object_ref(object_t *o)
 {
-	while (mutexLock(posixsrv_common.lock) < 0);
+	(void)pthread_mutex_lock(&posixsrv_common.lock);
 	o->refs++;
-	mutexUnlock(posixsrv_common.lock);
+	(void)pthread_mutex_unlock(&posixsrv_common.lock);
 }
 
 
 void posixsrv_object_put(object_t *o)
 {
-	while (mutexLock(posixsrv_common.lock) < 0);
+	(void)pthread_mutex_lock(&posixsrv_common.lock);
 
 	if (!--o->refs && o->destroy) {
 		TRACE("removing %d", o->linkage.id);
@@ -115,7 +116,7 @@ void posixsrv_object_put(object_t *o)
 			posixsrv_common.cache.o = NULL;
 
 		idtree_remove(&posixsrv_common.objects, &o->linkage);
-		mutexUnlock(posixsrv_common.lock);
+		(void)pthread_mutex_unlock(&posixsrv_common.lock);
 
 		if (o->operations->release != NULL)
 			o->operations->release(o);
@@ -123,7 +124,7 @@ void posixsrv_object_put(object_t *o)
 		return;
 	}
 
-	mutexUnlock(posixsrv_common.lock);
+	(void)pthread_mutex_unlock(&posixsrv_common.lock);
 	return;
 }
 
@@ -134,11 +135,11 @@ int posixsrv_object_create(object_t *o, const operations_t *ops)
 	o->operations = ops;
 	o->refs = 1;
 
-	while (mutexLock(posixsrv_common.lock) < 0);
+	(void)pthread_mutex_lock(&posixsrv_common.lock);
 	idtree_alloc(&posixsrv_common.objects, &o->linkage);
 	posixsrv_common.cache.id = o->linkage.id;
 	posixsrv_common.cache.o = o;
-	mutexUnlock(posixsrv_common.lock);
+	(void)pthread_mutex_unlock(&posixsrv_common.lock);
 
 	TRACE("created %d", o->linkage.id);
 
@@ -201,10 +202,10 @@ void rq_timeout(request_t *r, int ms)
 	gettime(&r->wakeup, NULL);
 	r->wakeup += 1000 * ms;
 
-	mutexLock(posixsrv_common.lock);
+	(void)pthread_mutex_lock(&posixsrv_common.lock);
 	lib_rbInsert(&posixsrv_common.timeout, &r->linkage);
-	mutexUnlock(posixsrv_common.lock);
-	condSignal(posixsrv_common.cond);
+	(void)pthread_mutex_unlock(&posixsrv_common.lock);
+	(void)pthread_cond_signal(&posixsrv_common.cond);
 }
 
 
@@ -328,9 +329,10 @@ void posixsrv_threadMain(void *arg)
 void posixsrv_threadRqTimeout(void *arg)
 {
 	request_t *r;
-	time_t now, timeout;
+	time_t now;
+	struct timespec deadline;
 
-	mutexLock(posixsrv_common.lock);
+	(void)pthread_mutex_lock(&posixsrv_common.lock);
 
 	for (;;) {
 		r = lib_treeof(request_t, linkage, lib_rbMinimum(posixsrv_common.timeout.root));
@@ -349,13 +351,14 @@ void posixsrv_threadRqTimeout(void *arg)
 				continue;
 			}
 
-			timeout = r->wakeup - now;
+			/* gettime() is CLOCK_MONOTONIC, the clock of the condition */
+			deadline.tv_sec = r->wakeup / 1000000;
+			deadline.tv_nsec = (long)(r->wakeup % 1000000) * 1000;
+			(void)pthread_cond_timedwait(&posixsrv_common.cond, &posixsrv_common.lock, &deadline);
 		}
 		else {
-			timeout = 0;
+			(void)pthread_cond_wait(&posixsrv_common.cond, &posixsrv_common.lock);
 		}
-
-		condWait(posixsrv_common.cond, posixsrv_common.lock, timeout);
 	}
 }
 
@@ -364,8 +367,16 @@ int posixsrv_init(unsigned *srvPort, unsigned *eventPort)
 {
 	idtree_init(&posixsrv_common.objects);
 	lib_rbInit(&posixsrv_common.timeout, rq_cmp, NULL);
-	mutexCreate(&posixsrv_common.lock);
-	condCreate(&posixsrv_common.cond);
+	pthread_condattr_t cattr;
+
+	if ((pthread_mutex_init(&posixsrv_common.lock, NULL) != 0) ||
+			(pthread_condattr_init(&cattr) != 0) ||
+			(pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) != 0) ||
+			(pthread_cond_init(&posixsrv_common.cond, &cattr) != 0)) {
+		fail("lock init");
+		return -1;
+	}
+	(void)pthread_condattr_destroy(&cattr);
 
 	if (portCreate(&posixsrv_common.port) < 0) {
 		fail("port create");
