@@ -391,8 +391,9 @@ static request_t *pipe_read_op(object_t *o, request_t *r)
 	if (was_full) {
 		/* read from pending writers */
 		while (p->queue != NULL && bytes < sz) {
+			c = min(sz - bytes, rq_sz(p->queue));
 			PIPE_TRACE("reading %d from pending writer\n", c);
-			memcpy(buf + bytes, rq_buf(p->queue), c = min(sz - bytes, rq_sz(p->queue)));
+			memcpy(buf + bytes, rq_buf(p->queue), c);
 			_pipe_wakeup(p, p->queue, c);
 			bytes += c;
 		}
@@ -616,10 +617,8 @@ int pipe_unlink(pipe_t *p, const char *path)
 
 	p->link--;
 
-	if (!(p->wrefs && p->rrefs) && !p->link) {
+	if (!p->wrefs && !p->rrefs && !p->link) {
 		posixsrv_object_destroy(&p->object);
-		pipe_unlock(&p->lock);
-		return EOK;
 	}
 
 	pipe_unlock(&p->lock);
@@ -679,7 +678,7 @@ static request_t *pipe_getattr_op(object_t *o, request_t *r)
 }
 
 
-int pipe_init()
+int pipe_init(void)
 {
 	object_t *o;
 	int err;

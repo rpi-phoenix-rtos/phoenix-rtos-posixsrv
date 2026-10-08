@@ -225,16 +225,15 @@ static int rq_cmp(rbnode_t *n1, rbnode_t *n2)
  *    RQ_EXPIRED under the table lock, then calls the object's timeout operation,
  *    which takes the object's lock, calls rq_timeoutClaim() and takes the
  *    request off the object's list to answer it (or to wait again).
+ *    A waker may instead take the request off the list before it calls
+ *    rq_timeoutCancel() (upstream's semaphore.c does): then, on zero, it must
+ *    leave the request alone, and the timeout operation tells the two cases
+ *    apart by r->next, which LIST_REMOVE() clears.
  * An armed request holds a reference to its object, so the object outlives
  * the timeout operation even if its last client closed it meanwhile.
  */
-void rq_timeout(request_t *r, int ms)
+static void rq_arm(request_t *r, time_t wakeup)
 {
-	time_t wakeup;
-
-	gettime(&wakeup, NULL);
-	wakeup += 1000 * (time_t)ms;
-
 	(void)pthread_mutex_lock(&posixsrv_common.lock);
 	if (r->timer == RQ_ARMED) {
 		/* already in the tree: changing its key or inserting it again would corrupt it */
@@ -248,6 +247,21 @@ void rq_timeout(request_t *r, int ms)
 	lib_rbInsert(&posixsrv_common.timeout, &r->linkage);
 	(void)pthread_mutex_unlock(&posixsrv_common.lock);
 	(void)pthread_cond_signal(&posixsrv_common.cond);
+}
+
+
+void rq_timeout(request_t *r, time_t usecs)
+{
+	time_t wakeup;
+
+	gettime(&wakeup, NULL);
+	rq_arm(r, wakeup + usecs);
+}
+
+
+void rq_timeoutAt(request_t *r, time_t deadline)
+{
+	rq_arm(r, deadline);
 }
 
 
@@ -517,6 +531,11 @@ int posixsrv_init(unsigned *srvPort, unsigned *eventPort)
 
 	if (tmpfile_init() < 0) {
 		fail("tmpfile init");
+		return -1;
+	}
+
+	if (semaphore_init() < 0) {
+		fail("semaphore init");
 		return -1;
 	}
 

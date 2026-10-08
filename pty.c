@@ -314,14 +314,14 @@ static request_t *_pts_read(pty_t *pty, request_t *r)
 	int err;
 
 	err = _libtty_read_nonblock(&pty->tty, r->msg.o.data, r->msg.o.size, r->msg.i.io.mode, &r->pts_read);
-	rq_setResponse(r, err);
+	rq_setResponse(r, err == 0 ? r->pts_read.prevlen : err);
 
 	/* libtty: a read answering 0 with timeout_ms >= 0 has to wait (an error ends it) */
 	if (err == 0 && r->pts_read.timeout_ms >= 0) {
 		LIST_ADD(&pty->read_requests, r);
 
 		if (r->pts_read.timeout_ms)
-			rq_timeout(r, r->pts_read.timeout_ms);
+			rq_timeout(r, (time_t)r->pts_read.timeout_ms * 1000);
 
 		r = NULL;
 	}
@@ -850,7 +850,7 @@ static request_t *ptmx_open_op(object_t *ptmx, request_t *r)
 }
 
 
-int pty_init()
+int pty_init(void)
 {
 	object_t *o;
 	int err;

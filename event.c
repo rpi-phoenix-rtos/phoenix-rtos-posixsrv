@@ -769,7 +769,7 @@ static request_t *queue_write_op(object_t *o, request_t *r)
 	(void)pthread_mutex_lock(&queue->lock);
 	if (!(count = _queue_readwrite(queue, subs, subcnt, events, evcnt)) && evcnt && timeout) {
 		if (timeout > 0)
-			rq_timeout(r, timeout);
+			rq_timeout(r, (time_t)timeout * 1000);
 
 		LIST_ADD(&queue->requests, r);
 		r = NULL;
@@ -802,7 +802,7 @@ static request_t *queue_devctl_op(object_t *o, request_t *r)
 	(void)pthread_mutex_lock(&queue->lock);
 	if (!(count = _queue_readwrite(queue, subs, subcnt, events, evcnt))) {
 		LIST_ADD(&queue->requests, r);
-		rq_timeout(r, timeout);
+		rq_timeout(r, (time_t)timeout * 1000);
 		r = NULL;
 	}
 	else {
